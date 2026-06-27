@@ -8,7 +8,7 @@ release/
 *.tsbuildinfo
 .npmrc
 CLAUDE.md
-# AGENTS.md
+AGENTS.md
 GEMINI.md
 /.claude
 /.codex
@@ -29,3 +29,4 @@ copilot-api
 .history
 CODEBUDDY.md
 .github
+mainWindow.js

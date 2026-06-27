@@ -8,8 +8,37 @@
 //! - system prompt 使用 `instructions` 字段而非 system role message
 //! - usage 字段命名与 Anthropic 一致 (input_tokens/output_tokens)
 
-use crate::proxy::error::ProxyError;
+use crate::proxy::{error::ProxyError, json_canonical::canonical_json_string};
 use serde_json::{json, Value};
+
+pub(crate) fn sanitize_anthropic_tool_use_input(name: &str, input: Value) -> Value {
+    if name != "Read" {
+        return input;
+    }
+
+    match input {
+        Value::Object(mut object) => {
+            if matches!(object.get("pages"), Some(Value::String(value)) if value.is_empty()) {
+                object.remove("pages");
+            }
+            Value::Object(object)
+        }
+        other => other,
+    }
+}
+
+pub(crate) fn sanitize_anthropic_tool_use_input_json(name: &str, raw: &str) -> String {
+    if name != "Read" || raw.is_empty() {
+        return raw.to_string();
+    }
+
+    let Ok(input) = serde_json::from_str::<Value>(raw) else {
+        return raw.to_string();
+    };
+
+    serde_json::to_string(&sanitize_anthropic_tool_use_input(name, input))
+        .unwrap_or_else(|_| raw.to_string())
+}
 
 /// Anthropic 请求 → OpenAI Responses 请求
 ///
@@ -35,10 +64,12 @@ pub fn anthropic_to_responses(
     // system → instructions (Responses API 使用 instructions 字段)
     if let Some(system) = body.get("system") {
         let instructions = if let Some(text) = system.as_str() {
-            text.to_string()
+            super::transform::strip_leading_anthropic_billing_header(text).to_string()
         } else if let Some(arr) = system.as_array() {
             arr.iter()
                 .filter_map(|msg| msg.get("text").and_then(|t| t.as_str()))
+                .map(super::transform::strip_leading_anthropic_billing_header)
+                .filter(|text| !text.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n\n")
         } else {
@@ -218,12 +249,28 @@ pub(crate) fn map_responses_stop_reason(
 
 /// Build Anthropic-style usage JSON from Responses API usage, including cache tokens.
 ///
-/// Priority order:
+/// **Robustness Features**:
+/// - Handles null, missing, empty objects, and partial objects gracefully
+/// - Supports OpenAI field name variants (prompt_tokens/completion_tokens) as fallbacks
+/// - Always returns valid structure: {"input_tokens": N, "output_tokens": N}
+/// - Preserves cache token fields even when input/output tokens are missing
+///
+/// **Field Name Resolution Priority**:
+/// 1. input_tokens: Anthropic `input_tokens` → OpenAI `prompt_tokens` → default 0
+/// 2. output_tokens: Anthropic `output_tokens` → OpenAI `completion_tokens` → default 0
+/// 3. cache_read_input_tokens: Direct field → nested input_tokens_details.cached_tokens → prompt_tokens_details.cached_tokens
+/// 4. cache_creation_input_tokens: Direct field only
+///
+/// **Cache Token Priority Order**:
 /// 1. OpenAI nested details (`input_tokens_details.cached_tokens`, `prompt_tokens_details.cached_tokens`) as initial value
 /// 2. Direct Anthropic-style fields (`cache_read_input_tokens`, `cache_creation_input_tokens`) override if present
+///
+/// **Logging**:
+/// - Warns on empty objects {} or partial objects (only one field present)
+/// - Debug logs when using OpenAI field name fallbacks
 pub(crate) fn build_anthropic_usage_from_responses(usage: Option<&Value>) -> Value {
     let u = match usage {
-        Some(v) if !v.is_null() => v,
+        Some(v) if !v.is_null() && v.is_object() => v,
         _ => {
             return json!({
                 "input_tokens": 0,
@@ -232,15 +279,56 @@ pub(crate) fn build_anthropic_usage_from_responses(usage: Option<&Value>) -> Val
         }
     };
 
-    let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    // Detect empty object {} and log warning
+    if u.as_object().map(|obj| obj.is_empty()).unwrap_or(false) {
+        log::warn!("[Responses] Empty usage object received, using defaults");
+        return json!({
+            "input_tokens": 0,
+            "output_tokens": 0
+        });
+    }
+
+    // Extract input_tokens with OpenAI field name fallback
+    // Priority: input_tokens (Anthropic) → prompt_tokens (OpenAI) → 0
+    let input = u
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            let prompt_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64());
+            if prompt_tokens.is_some() {
+                log::debug!(
+                    "[Responses] Using OpenAI field name fallback 'prompt_tokens' for input_tokens"
+                );
+            }
+            prompt_tokens
+        })
+        .unwrap_or(0);
+
+    // Extract output_tokens with OpenAI field name fallback
+    // Priority: output_tokens (Anthropic) → completion_tokens (OpenAI) → 0
+    let output = u.get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            let completion_tokens = u.get("completion_tokens").and_then(|v| v.as_u64());
+            if completion_tokens.is_some() {
+                log::debug!("[Responses] Using OpenAI field name fallback 'completion_tokens' for output_tokens");
+            }
+            completion_tokens
+        })
+        .unwrap_or(0);
+
+    // Log if only one field present (partial object). Streaming chunks legitimately
+    // arrive with partial usage, so this stays at debug level to avoid noise.
+    if (input == 0 && output > 0) || (input > 0 && output == 0) {
+        log::debug!("[Responses] Partial usage object: {:?}", u);
+    }
 
     let mut result = json!({
         "input_tokens": input,
         "output_tokens": output
     });
 
-    // Step 1: OpenAI nested details as fallback
+    // Step 1: OpenAI nested details as fallback for cache tokens
     // OpenAI Responses API: input_tokens_details.cached_tokens
     if let Some(cached) = u
         .pointer("/input_tokens_details/cached_tokens")
@@ -259,11 +347,29 @@ pub(crate) fn build_anthropic_usage_from_responses(usage: Option<&Value>) -> Val
     }
 
     // Step 2: Direct Anthropic-style fields override (authoritative if present)
+    // These preserve cache tokens even if input/output_tokens are missing
     if let Some(v) = u.get("cache_read_input_tokens") {
         result["cache_read_input_tokens"] = v.clone();
     }
     if let Some(v) = u.get("cache_creation_input_tokens") {
         result["cache_creation_input_tokens"] = v.clone();
+    }
+
+    // OpenAI/Responses 的 input(prompt_tokens/input_tokens)含缓存命中，Anthropic input_tokens 不含
+    // → 减去 cache_read 与 cache_creation，使其成为 fresh input。本函数在计量意义上是 claude 专属
+    // （Codex Responses 透传走 from_codex_response_*，不调用本函数），故可安全在此扣减。三桶互斥，
+    // 恒等：input + cache_read + cache_creation == 上游 input(inclusive)。与 build_anthropic_usage_json
+    // (#2774) 及 transform_gemini 的 saturating_sub 对称；一处同时覆盖非流式与流式(streaming_responses)。
+    let cached = result
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_creation = result
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if cached > 0 || cache_creation > 0 {
+        result["input_tokens"] = json!(input.saturating_sub(cached).saturating_sub(cache_creation));
     }
 
     result
@@ -352,7 +458,7 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
                                 "type": "function_call",
                                 "call_id": id,
                                 "name": name,
-                                "arguments": serde_json::to_string(&arguments).unwrap_or_default()
+                                "arguments": canonical_json_string(&arguments)
                             }));
                         }
 
@@ -373,7 +479,7 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
                                 .unwrap_or("");
                             let output = match block.get("content") {
                                 Some(Value::String(s)) => s.clone(),
-                                Some(v) => serde_json::to_string(v).unwrap_or_default(),
+                                Some(v) => canonical_json_string(v),
                                 None => String::new(),
                             };
 
@@ -454,6 +560,7 @@ pub fn responses_to_anthropic(body: Value) -> Result<Value, ProxyError> {
                     .and_then(|a| a.as_str())
                     .unwrap_or("{}");
                 let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                let input = sanitize_anthropic_tool_use_input(name, input);
 
                 content.push(json!({
                     "type": "tool_use",
@@ -554,6 +661,48 @@ mod tests {
     }
 
     #[test]
+    fn test_anthropic_to_responses_strips_leading_billing_header_from_system_string() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_tokens": 1024,
+            "system": "x-anthropic-billing-header: cc_version=2.1.119.47e; cc_entrypoint=sdk-cli; cch=a7754;\n\nYou are a helpful assistant.",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(result["instructions"], "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_strips_billing_header_with_crlf() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_tokens": 1024,
+            "system": "x-anthropic-billing-header: cc_version=2.1.119.47e; cc_entrypoint=sdk-cli; cch=a7754;\r\n\r\nYou are a helpful assistant.",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(result["instructions"], "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_keeps_non_leading_billing_header_text() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_tokens": 1024,
+            "system": "Keep this literal:\nx-anthropic-billing-header: example",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(
+            result["instructions"],
+            "Keep this literal:\nx-anthropic-billing-header: example"
+        );
+    }
+
+    #[test]
     fn test_anthropic_to_responses_with_system_array() {
         let input = json!({
             "model": "gpt-4o",
@@ -567,6 +716,41 @@ mod tests {
 
         let result = anthropic_to_responses(input, None, false, false).unwrap();
         assert_eq!(result["instructions"], "Part 1\n\nPart 2");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_strips_billing_header_from_system_array_parts() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_tokens": 1024,
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.119.47e; cc_entrypoint=sdk-cli; cch=a7754;\n"},
+                {"type": "text", "text": "Stable prompt"}
+            ],
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(result["instructions"], "Stable prompt");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_preserves_prompt_after_billing_header_in_same_part() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_tokens": 1024,
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.119.47e; cc_entrypoint=sdk-cli; cch=a7754;\n\nStable prompt part 1"},
+                {"type": "text", "text": "Stable prompt part 2"}
+            ],
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(
+            result["instructions"],
+            "Stable prompt part 1\n\nStable prompt part 2"
+        );
     }
 
     #[test]
@@ -769,6 +953,56 @@ mod tests {
     }
 
     #[test]
+    fn test_responses_to_anthropic_read_drops_empty_pages() {
+        let input = json!({
+            "id": "resp_read",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5.5",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_read",
+                "call_id": "call_read",
+                "name": "Read",
+                "arguments": "{\"file_path\":\"/tmp/demo.py\",\"limit\":2000,\"offset\":0,\"pages\":\"\"}",
+                "status": "completed"
+            }]
+        });
+
+        let result = responses_to_anthropic(input).unwrap();
+        let tool_input = &result["content"][0]["input"];
+
+        assert_eq!(result["content"][0]["type"], "tool_use");
+        assert_eq!(result["content"][0]["name"], "Read");
+        assert_eq!(tool_input["file_path"], "/tmp/demo.py");
+        assert_eq!(tool_input["limit"], 2000);
+        assert_eq!(tool_input["offset"], 0);
+        assert!(tool_input.get("pages").is_none());
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_preserves_empty_strings_for_other_tools() {
+        let input = json!({
+            "id": "resp_other",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5.5",
+            "output": [{
+                "type": "function_call",
+                "id": "fc_other",
+                "call_id": "call_other",
+                "name": "search",
+                "arguments": "{\"query\":\"\"}",
+                "status": "completed"
+            }]
+        });
+
+        let result = responses_to_anthropic(input).unwrap();
+
+        assert_eq!(result["content"][0]["input"]["query"], "");
+    }
+
+    #[test]
     fn test_responses_to_anthropic_with_refusal_block() {
         let input = json!({
             "id": "resp_123",
@@ -939,7 +1173,8 @@ mod tests {
         });
 
         let result = responses_to_anthropic(input).unwrap();
-        assert_eq!(result["usage"]["input_tokens"], 100);
+        // input_tokens(100) 含 cached(80)，转换后 input 应为 fresh = 100 - 80 = 20
+        assert_eq!(result["usage"]["input_tokens"], 20);
         assert_eq!(result["usage"]["output_tokens"], 50);
         assert_eq!(result["usage"]["cache_read_input_tokens"], 80);
     }
@@ -963,6 +1198,9 @@ mod tests {
         });
 
         let result = responses_to_anthropic(input).unwrap();
+        // cache_read(60)+cache_creation(20) 均从 input(100) 扣除，fresh = 100 - 60 - 20 = 20
+        // 守恒：input(20) + cache_read(60) + cache_creation(20) == 上游 input(100)
+        assert_eq!(result["usage"]["input_tokens"], 20);
         assert_eq!(result["usage"]["cache_read_input_tokens"], 60);
         assert_eq!(result["usage"]["cache_creation_input_tokens"], 20);
     }
@@ -1351,5 +1589,125 @@ mod tests {
             result.get("tools").is_none(),
             "非 Codex OAuth 路径下 tools 在客户端未送时不应被注入"
         );
+    }
+
+    // ==================== Usage Field Robustness Tests ====================
+
+    #[test]
+    fn test_build_usage_from_null_parameter() {
+        let result = build_anthropic_usage_from_responses(None);
+        assert_eq!(result["input_tokens"], json!(0));
+        assert_eq!(result["output_tokens"], json!(0));
+    }
+
+    #[test]
+    fn test_build_usage_from_null_json_value() {
+        let result = build_anthropic_usage_from_responses(Some(&json!(null)));
+        assert_eq!(result["input_tokens"], json!(0));
+        assert_eq!(result["output_tokens"], json!(0));
+    }
+
+    #[test]
+    fn test_build_usage_from_empty_object() {
+        let result = build_anthropic_usage_from_responses(Some(&json!({})));
+        assert_eq!(result["input_tokens"], json!(0));
+        assert_eq!(result["output_tokens"], json!(0));
+    }
+
+    #[test]
+    fn test_build_usage_from_partial_input_only() {
+        let result = build_anthropic_usage_from_responses(Some(&json!({
+            "input_tokens": 100
+        })));
+        assert_eq!(result["input_tokens"], json!(100));
+        assert_eq!(result["output_tokens"], json!(0));
+    }
+
+    #[test]
+    fn test_build_usage_from_partial_output_only() {
+        let result = build_anthropic_usage_from_responses(Some(&json!({
+            "output_tokens": 50
+        })));
+        assert_eq!(result["input_tokens"], json!(0));
+        assert_eq!(result["output_tokens"], json!(50));
+    }
+
+    #[test]
+    fn test_build_usage_with_openai_field_names() {
+        let result = build_anthropic_usage_from_responses(Some(&json!({
+            "prompt_tokens": 120,
+            "completion_tokens": 45
+        })));
+        assert_eq!(result["input_tokens"], json!(120));
+        assert_eq!(result["output_tokens"], json!(45));
+    }
+
+    #[test]
+    fn test_build_usage_anthropic_names_precedence() {
+        let result = build_anthropic_usage_from_responses(Some(&json!({
+            "input_tokens": 100,
+            "prompt_tokens": 120,
+            "output_tokens": 50,
+            "completion_tokens": 45
+        })));
+        assert_eq!(result["input_tokens"], json!(100)); // Anthropic name takes precedence
+        assert_eq!(result["output_tokens"], json!(50)); // Anthropic name takes precedence
+    }
+
+    #[test]
+    fn test_build_usage_cache_tokens_from_nested_details() {
+        let result = build_anthropic_usage_from_responses(Some(&json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "input_tokens_details": {
+                "cached_tokens": 80
+            }
+        })));
+        // input_tokens(100) 含 nested cached(80)，转换后 input 应为 fresh = 100 - 80 = 20
+        assert_eq!(result["input_tokens"], json!(20));
+        assert_eq!(result["output_tokens"], json!(50));
+        assert_eq!(result["cache_read_input_tokens"], json!(80));
+    }
+
+    #[test]
+    fn test_build_usage_cache_tokens_direct_override() {
+        let result = build_anthropic_usage_from_responses(Some(&json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "input_tokens_details": {
+                "cached_tokens": 80
+            },
+            "cache_read_input_tokens": 100
+        })));
+        // 直传 cache_read(100) 优先于 nested(80)；input(100) - 100 = 0（fresh）
+        assert_eq!(result["input_tokens"], json!(0));
+        assert_eq!(result["cache_read_input_tokens"], json!(100)); // Direct field overrides nested
+    }
+
+    #[test]
+    fn test_build_usage_clamps_input_when_cache_exceeds_input() {
+        // input(100) < cache_read(60)+cache_creation(50)=110：saturating 钳到 0，防下溢。
+        // 钉桩：阻止未来把 saturating_sub 误改成普通减法(debug panic / release wrap)。
+        let result = build_anthropic_usage_from_responses(Some(&json!({
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "cache_read_input_tokens": 60,
+            "cache_creation_input_tokens": 50
+        })));
+        assert_eq!(result["input_tokens"], json!(0));
+        assert_eq!(result["cache_read_input_tokens"], json!(60));
+        assert_eq!(result["cache_creation_input_tokens"], json!(50));
+    }
+
+    #[test]
+    fn test_build_usage_cache_tokens_without_input_output() {
+        let result = build_anthropic_usage_from_responses(Some(&json!({
+            "cache_read_input_tokens": 60,
+            "cache_creation_input_tokens": 20
+        })));
+        assert_eq!(result["input_tokens"], json!(0));
+        assert_eq!(result["output_tokens"], json!(0));
+        assert_eq!(result["cache_read_input_tokens"], json!(60));
+        assert_eq!(result["cache_creation_input_tokens"], json!(20));
     }
 }
